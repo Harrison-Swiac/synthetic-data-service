@@ -78,25 +78,73 @@ def cat_overlap(ref: pd.Series, syn: pd.Series):
 @app.post("/synthesize/tabular")
 async def synthesize_tabular(num_rows: int = Form(1000), file: UploadFile = File(...)):
     """
-    Learn patterns from the input CSV and generate NEW rows using SDV GaussianCopula.
+    SDV GaussianCopula with schema hints + postprocessing guardrails.
     """
     content = await file.read()
-    df = pd.read_csv(io.BytesIO(content))
-    df = guess_datetime_cols(df)
+    df = pd.read_csv(io.BytesIO(content)).copy()
 
+    # --- Basic typing hints ---
+    # Dates
+    for col in df.columns:
+        if "date" in col.lower() or "time" in col.lower():
+            with pd.option_context("mode.chained_assignment", None):
+                try:
+                    df[col] = pd.to_datetime(df[col], errors="coerce")
+                except Exception:
+                    pass
+
+    # Build metadata and override a few sdtypes
     metadata = SingleTableMetadata()
     metadata.detect_from_dataframe(data=df)
 
+    # Explicitly mark IDs / categoricals / datetimes when obvious
+    if "patient_id" in df.columns:
+        metadata.update_column(column_name="patient_id", sdtype="id")
+
+    # Heuristic categorical: low-cardinality object columns
+    for col in df.select_dtypes(include=["object"]).columns:
+        if df[col].nunique(dropna=True) <= max(20, int(0.1 * max(1, len(df)))):
+            metadata.update_column(column_name=col, sdtype="categorical")
+
+    # Enforce a simple date format for any datetime columns
+    for col in df.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns:
+        metadata.update_column(column_name=col, sdtype="datetime", datetime_format="%Y-%m-%d")
+
+    # --- Fit model ---
     synth = GaussianCopulaSynthesizer(metadata)
     synth.fit(df)
-    out_df = synth.sample(num_rows)
 
-    # tidy datetimes and add a flag
+    # Cap rows to something sensible on tiny inputs
+    target_rows = max(1, min(int(num_rows), 50000))
+    out_df = synth.sample(target_rows)
+
+    # --- Postprocessing guardrails ---
+    # Clip numeric columns to original min/max to avoid wild tails on tiny inputs
+    num_cols = df.select_dtypes(include=["number"]).columns
+    for c in num_cols:
+        try:
+            lo, hi = float(df[c].min()), float(df[c].max())
+            out_df[c] = out_df[c].clip(lower=lo, upper=hi)
+        except Exception:
+            pass
+
+    # Keep categories within the original set (map unknowns to a valid category)
+    cat_cols = [c for c in df.columns if c not in num_cols]
+    for c in cat_cols:
+        if c in out_df.columns and df[c].dtype == "object":
+            valid = df[c].dropna().astype(str).unique().tolist()
+            if valid:
+                out_df[c] = out_df[c].astype(str).apply(lambda v: v if v in valid else valid[hash(v) % len(valid)])
+
+    # Tidy datetimes back to strings
     for col in out_df.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns:
         out_df[col] = out_df[col].dt.strftime("%Y-%m-%d")
+
+    # Add a synthetic flag/id
     out_df["synthetic_id"] = [str(uuid.uuid4())[:8] for _ in range(len(out_df))]
 
     return df_to_csv_response(out_df, download_name=f"synthetic_{file.filename}")
+
 
 # ---------------- Privacy check (heuristic) ----------------
 @app.post("/validate/privacy")
