@@ -5,13 +5,11 @@ import numpy as np
 import io, uuid
 from datetime import datetime
 
-# SDV (fast, CPU-friendly)
+# SDV (fast, CPU-friendly model for tabular data)
 from sdv.single_table import GaussianCopulaSynthesizer
 from sdv.metadata import SingleTableMetadata
 
-
-app = FastAPI(title="Synthetic Data Service", version="0.4.0")
-
+app = FastAPI(title="Synthetic Data Service", version="0.5.0")
 
 # ---------------- Root & Health ----------------
 @app.get("/")
@@ -26,20 +24,21 @@ def root():
         ],
     }
 
-
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
-
 # ---------------- Helpers ----------------
 PII_HINTS = {
-    "name", "first_name", "last_name", "surname", "dob", "date_of_birth", "birthdate",
-    "ssn", "tax", "medicare", "passport", "driver", "licence", "license", "email", "phone",
-    "mobile", "address", "postcode", "zipcode", "credit", "card", "iban", "account",
+    "name", "first_name", "last_name", "surname",
+    "dob", "date_of_birth", "birthdate",
+    "ssn", "tax", "medicare", "passport",
+    "driver", "licence", "license",
+    "email", "phone", "mobile",
+    "address", "postcode", "zipcode",
+    "credit", "card", "iban", "account",
     "mrn", "patient_id", "nhs", "uhid"
 }
-
 
 def df_to_csv_response(df: pd.DataFrame, download_name: str):
     buf = io.StringIO()
@@ -51,9 +50,8 @@ def df_to_csv_response(df: pd.DataFrame, download_name: str):
         headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
     )
 
-
 def coerce_datetimes(df: pd.DataFrame):
-    """Try to parse date/time-ish columns to datetime."""
+    """Try to parse date/time-ish columns to datetime dtype."""
     for col in df.columns:
         lc = col.lower()
         if "date" in lc or "time" in lc:
@@ -64,13 +62,12 @@ def coerce_datetimes(df: pd.DataFrame):
                     pass
     return df
 
-
 def build_metadata(df: pd.DataFrame) -> SingleTableMetadata:
-    """Let SDV infer types, then add helpful hints for better fidelity."""
+    """Infer column types, then add hints for better fidelity."""
     meta = SingleTableMetadata()
     meta.detect_from_dataframe(data=df)
 
-    # IDs
+    # Treat obvious IDs correctly
     if "patient_id" in df.columns:
         meta.update_column("patient_id", sdtype="id")
 
@@ -82,16 +79,22 @@ def build_metadata(df: pd.DataFrame) -> SingleTableMetadata:
         except Exception:
             pass
 
-    # Datetimes with a consistent format
+    # Datetime columns with a consistent format
     for col in df.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns:
         meta.update_column(col, sdtype="datetime", datetime_format="%Y-%m-%d")
 
     return meta
 
+def guardrails(df_in: pd.DataFrame, df_out: pd.DataFrame, id_cols: set | None = None) -> pd.DataFrame:
+    """
+    Post-process synthetic output to keep values plausible and clean.
+    - Clip numeric columns to source min/max.
+    - Fence categoricals to source vocab (but never for ID columns).
+    - Serialise datetimes to ISO strings.
+    """
+    id_cols = id_cols or set()
 
-def guardrails(df_in: pd.DataFrame, df_out: pd.DataFrame) -> pd.DataFrame:
-    """Post-process synthetic output to keep values plausible and clean."""
-    # Numeric bounds: clip to observed min/max in source
+    # Numeric bounds
     num_cols = df_in.select_dtypes(include=["number"]).columns
     for c in num_cols:
         try:
@@ -100,8 +103,10 @@ def guardrails(df_in: pd.DataFrame, df_out: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             pass
 
-    # Categoricals: restrict to original vocabulary
+    # Categoricals: restrict to source vocab (skip ids)
     for c in df_in.columns:
+        if c in id_cols:
+            continue
         if c in df_out.columns and df_in[c].dtype == "object":
             vocab = df_in[c].dropna().astype(str).unique().tolist()
             if vocab:
@@ -115,9 +120,8 @@ def guardrails(df_in: pd.DataFrame, df_out: pd.DataFrame) -> pd.DataFrame:
 
     return df_out
 
-
 def psi_numeric(ref: pd.Series, syn: pd.Series, bins: int = 10) -> float:
-    """Population Stability Index for numeric columns (rough, but useful)."""
+    """Population Stability Index for numeric columns (rough but useful)."""
     ref_n, syn_n = ref.dropna(), syn.dropna()
     if ref_n.nunique() == 0:
         return 0.0
@@ -136,7 +140,6 @@ def psi_numeric(ref: pd.Series, syn: pd.Series, bins: int = 10) -> float:
     syn_p = (syn_hist + 1e-6) / (syn_hist.sum() + 1e-6 * len(syn_hist))
     return float(np.sum((syn_p - ref_p) * np.log(syn_p / ref_p)))
 
-
 def cat_overlap(ref: pd.Series, syn: pd.Series):
     """Simple Jaccard + coverage for categories."""
     a = set(ref.dropna().astype(str).unique())
@@ -146,7 +149,6 @@ def cat_overlap(ref: pd.Series, syn: pd.Series):
     inter = len(a & b)
     union = len(a | b) or 1
     return {"jaccard": inter / union, "coverage": inter / (len(a) or 1)}
-
 
 # ---------------- Synthesize (GaussianCopula) ----------------
 @app.post("/synthesize/tabular")
@@ -165,11 +167,12 @@ async def synthesize_tabular(num_rows: int = Form(1000), file: UploadFile = File
 
     rows = max(1, min(int(num_rows), 50000))
     out_df = synthesizer.sample(rows)
-    out_df = guardrails(df, out_df)
+
+    id_cols = {"patient_id"} if "patient_id" in df.columns else set()
+    out_df = guardrails(df, out_df, id_cols=id_cols)
+
     out_df["synthetic_id"] = [str(uuid.uuid4())[:8] for _ in range(len(out_df))]
-
     return df_to_csv_response(out_df, download_name=f"synthetic_{file.filename}")
-
 
 # ---------------- Privacy check (heuristic) ----------------
 @app.post("/validate/privacy")
@@ -186,7 +189,6 @@ async def validate_privacy(file: UploadFile = File(...)):
         "pii_hint_count": len(flagged),
         "advice": "Avoid uploading direct identifiers. Map IDs to surrogate keys before synthesis."
     })
-
 
 # ---------------- Quick evaluation ----------------
 @app.post("/evaluate/tabular")
