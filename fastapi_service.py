@@ -5,34 +5,41 @@ import numpy as np
 import io, uuid
 from datetime import datetime
 
-# SDV (CPU-friendly model)
+# SDV (fast, CPU-friendly)
 from sdv.single_table import GaussianCopulaSynthesizer
 from sdv.metadata import SingleTableMetadata
 
-app = FastAPI(title="Synthetic Data Service", version="0.3.0")
 
-# ---------------- Health ----------------
+app = FastAPI(title="Synthetic Data Service", version="0.4.0")
+
+
+# ---------------- Root & Health ----------------
+@app.get("/")
+def root():
+    return {
+        "service": "Synthetic Data Service",
+        "endpoints": [
+            "/health",
+            "/synthesize/tabular",
+            "/validate/privacy",
+            "/evaluate/tabular",
+        ],
+    }
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
+
 # ---------------- Helpers ----------------
 PII_HINTS = {
     "name", "first_name", "last_name", "surname", "dob", "date_of_birth", "birthdate",
-    "ssn", "tax", "medicare", "passport", "driver", "license", "email", "phone",
+    "ssn", "tax", "medicare", "passport", "driver", "licence", "license", "email", "phone",
     "mobile", "address", "postcode", "zipcode", "credit", "card", "iban", "account",
     "mrn", "patient_id", "nhs", "uhid"
 }
 
-def guess_datetime_cols(df: pd.DataFrame):
-    for col in df.columns:
-        if "date" in col.lower() or "time" in col.lower():
-            with pd.option_context("mode.chained_assignment", None):
-                try:
-                    df[col] = pd.to_datetime(df[col], errors="coerce")
-                except Exception:
-                    pass
-    return df
 
 def df_to_csv_response(df: pd.DataFrame, download_name: str):
     buf = io.StringIO()
@@ -41,17 +48,82 @@ def df_to_csv_response(df: pd.DataFrame, download_name: str):
     return StreamingResponse(
         iter([buf.getvalue()]),
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{download_name}"'}
+        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
     )
 
+
+def coerce_datetimes(df: pd.DataFrame):
+    """Try to parse date/time-ish columns to datetime."""
+    for col in df.columns:
+        lc = col.lower()
+        if "date" in lc or "time" in lc:
+            with pd.option_context("mode.chained_assignment", None):
+                try:
+                    df[col] = pd.to_datetime(df[col], errors="coerce")
+                except Exception:
+                    pass
+    return df
+
+
+def build_metadata(df: pd.DataFrame) -> SingleTableMetadata:
+    """Let SDV infer types, then add helpful hints for better fidelity."""
+    meta = SingleTableMetadata()
+    meta.detect_from_dataframe(data=df)
+
+    # IDs
+    if "patient_id" in df.columns:
+        meta.update_column("patient_id", sdtype="id")
+
+    # Low-cardinality strings -> categorical
+    for col in df.select_dtypes(include=["object"]).columns:
+        try:
+            if df[col].nunique(dropna=True) <= max(20, int(0.1 * max(1, len(df)))):
+                meta.update_column(col, sdtype="categorical")
+        except Exception:
+            pass
+
+    # Datetimes with a consistent format
+    for col in df.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns:
+        meta.update_column(col, sdtype="datetime", datetime_format="%Y-%m-%d")
+
+    return meta
+
+
+def guardrails(df_in: pd.DataFrame, df_out: pd.DataFrame) -> pd.DataFrame:
+    """Post-process synthetic output to keep values plausible and clean."""
+    # Numeric bounds: clip to observed min/max in source
+    num_cols = df_in.select_dtypes(include=["number"]).columns
+    for c in num_cols:
+        try:
+            lo, hi = float(df_in[c].min()), float(df_in[c].max())
+            df_out[c] = pd.to_numeric(df_out[c], errors="coerce").clip(lower=lo, upper=hi)
+        except Exception:
+            pass
+
+    # Categoricals: restrict to original vocabulary
+    for c in df_in.columns:
+        if c in df_out.columns and df_in[c].dtype == "object":
+            vocab = df_in[c].dropna().astype(str).unique().tolist()
+            if vocab:
+                df_out[c] = df_out[c].astype(str).apply(
+                    lambda v: v if v in vocab else vocab[hash(v) % len(vocab)]
+                )
+
+    # Datetimes -> ISO strings
+    for col in df_out.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns:
+        df_out[col] = df_out[col].dt.strftime("%Y-%m-%d")
+
+    return df_out
+
+
 def psi_numeric(ref: pd.Series, syn: pd.Series, bins: int = 10) -> float:
-    ref_n = ref.dropna()
-    syn_n = syn.dropna()
+    """Population Stability Index for numeric columns (rough, but useful)."""
+    ref_n, syn_n = ref.dropna(), syn.dropna()
     if ref_n.nunique() == 0:
         return 0.0
     try:
-        quantiles = np.linspace(0, 1, bins + 1)
-        edges = np.unique(ref_n.quantile(quantiles).values)
+        q = np.linspace(0, 1, bins + 1)
+        edges = np.unique(ref_n.quantile(q).values)
         if len(edges) < 3:
             edges = np.linspace(ref_n.min(), ref_n.max(), min(3, bins + 1))
     except Exception:
@@ -60,87 +132,40 @@ def psi_numeric(ref: pd.Series, syn: pd.Series, bins: int = 10) -> float:
         return 0.0
     ref_hist, _ = np.histogram(ref_n, bins=edges)
     syn_hist, _ = np.histogram(syn_n, bins=edges)
-    ref_prop = (ref_hist + 1e-6) / (ref_hist.sum() + 1e-6 * len(ref_hist))
-    syn_prop = (syn_hist + 1e-6) / (syn_hist.sum() + 1e-6 * len(syn_hist))
-    psi_vals = (syn_prop - ref_prop) * np.log(syn_prop / ref_prop)
-    return float(np.sum(psi_vals))
+    ref_p = (ref_hist + 1e-6) / (ref_hist.sum() + 1e-6 * len(ref_hist))
+    syn_p = (syn_hist + 1e-6) / (syn_hist.sum() + 1e-6 * len(syn_hist))
+    return float(np.sum((syn_p - ref_p) * np.log(syn_p / ref_p)))
+
 
 def cat_overlap(ref: pd.Series, syn: pd.Series):
+    """Simple Jaccard + coverage for categories."""
     a = set(ref.dropna().astype(str).unique())
     b = set(syn.dropna().astype(str).unique())
     if not a and not b:
         return {"jaccard": 1.0, "coverage": 1.0}
     inter = len(a & b)
-    union = len(a | b) if a | b else 1
-    return {"jaccard": inter / union, "coverage": inter / (len(a) if len(a) else 1)}
+    union = len(a | b) or 1
+    return {"jaccard": inter / union, "coverage": inter / (len(a) or 1)}
 
-# ---------------- Synthesize (real) ----------------
+
+# ---------------- Synthesize (GaussianCopula) ----------------
 @app.post("/synthesize/tabular")
 async def synthesize_tabular(num_rows: int = Form(1000), file: UploadFile = File(...)):
     """
-    SDV GaussianCopula with schema hints + postprocessing guardrails.
+    Accepts a CSV and returns a *truly synthetic* CSV generated with SDV's GaussianCopula.
+    Adds light guardrails and a synthetic_id column.
     """
     content = await file.read()
     df = pd.read_csv(io.BytesIO(content)).copy()
+    df = coerce_datetimes(df)
 
-    # --- Basic typing hints ---
-    # Dates
-    for col in df.columns:
-        if "date" in col.lower() or "time" in col.lower():
-            with pd.option_context("mode.chained_assignment", None):
-                try:
-                    df[col] = pd.to_datetime(df[col], errors="coerce")
-                except Exception:
-                    pass
+    meta = build_metadata(df)
+    synthesizer = GaussianCopulaSynthesizer(meta)
+    synthesizer.fit(df)
 
-    # Build metadata and override a few sdtypes
-    metadata = SingleTableMetadata()
-    metadata.detect_from_dataframe(data=df)
-
-    # Explicitly mark IDs / categoricals / datetimes when obvious
-    if "patient_id" in df.columns:
-        metadata.update_column(column_name="patient_id", sdtype="id")
-
-    # Heuristic categorical: low-cardinality object columns
-    for col in df.select_dtypes(include=["object"]).columns:
-        if df[col].nunique(dropna=True) <= max(20, int(0.1 * max(1, len(df)))):
-            metadata.update_column(column_name=col, sdtype="categorical")
-
-    # Enforce a simple date format for any datetime columns
-    for col in df.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns:
-        metadata.update_column(column_name=col, sdtype="datetime", datetime_format="%Y-%m-%d")
-
-    # --- Fit model ---
-    synth = GaussianCopulaSynthesizer(metadata)
-    synth.fit(df)
-
-    # Cap rows to something sensible on tiny inputs
-    target_rows = max(1, min(int(num_rows), 50000))
-    out_df = synth.sample(target_rows)
-
-    # --- Postprocessing guardrails ---
-    # Clip numeric columns to original min/max to avoid wild tails on tiny inputs
-    num_cols = df.select_dtypes(include=["number"]).columns
-    for c in num_cols:
-        try:
-            lo, hi = float(df[c].min()), float(df[c].max())
-            out_df[c] = out_df[c].clip(lower=lo, upper=hi)
-        except Exception:
-            pass
-
-    # Keep categories within the original set (map unknowns to a valid category)
-    cat_cols = [c for c in df.columns if c not in num_cols]
-    for c in cat_cols:
-        if c in out_df.columns and df[c].dtype == "object":
-            valid = df[c].dropna().astype(str).unique().tolist()
-            if valid:
-                out_df[c] = out_df[c].astype(str).apply(lambda v: v if v in valid else valid[hash(v) % len(valid)])
-
-    # Tidy datetimes back to strings
-    for col in out_df.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns:
-        out_df[col] = out_df[col].dt.strftime("%Y-%m-%d")
-
-    # Add a synthetic flag/id
+    rows = max(1, min(int(num_rows), 50000))
+    out_df = synthesizer.sample(rows)
+    out_df = guardrails(df, out_df)
     out_df["synthetic_id"] = [str(uuid.uuid4())[:8] for _ in range(len(out_df))]
 
     return df_to_csv_response(out_df, download_name=f"synthetic_{file.filename}")
@@ -149,9 +174,6 @@ async def synthesize_tabular(num_rows: int = Form(1000), file: UploadFile = File
 # ---------------- Privacy check (heuristic) ----------------
 @app.post("/validate/privacy")
 async def validate_privacy(file: UploadFile = File(...)):
-    """
-    Flags columns that look like identifiers by name. MVP heuristic.
-    """
     content = await file.read()
     df = pd.read_csv(io.BytesIO(content))
     flagged = []
@@ -165,31 +187,24 @@ async def validate_privacy(file: UploadFile = File(...)):
         "advice": "Avoid uploading direct identifiers. Map IDs to surrogate keys before synthesis."
     })
 
+
 # ---------------- Quick evaluation ----------------
 @app.post("/evaluate/tabular")
 async def evaluate_tabular(reference_file: UploadFile = File(...), synthetic_file: UploadFile = File(...)):
-    """
-    Compare reference vs synthetic:
-      - PSI for numeric columns (lower is better)
-      - Category overlap for categoricals (higher is better)
-    """
     ref_df = pd.read_csv(io.BytesIO(await reference_file.read()))
     syn_df = pd.read_csv(io.BytesIO(await synthetic_file.read()))
     shared = [c for c in ref_df.columns if c in syn_df.columns]
-    ref_df = ref_df[shared]
-    syn_df = syn_df[shared]
+    ref_df, syn_df = ref_df[shared], syn_df[shared]
 
     nums = [c for c in shared if pd.api.types.is_numeric_dtype(ref_df[c])]
     cats = [c for c in shared if not pd.api.types.is_numeric_dtype(ref_df[c])]
 
-    psi_scores = {}
+    psi_scores, overlap = {}, {}
     for c in nums:
         try:
             psi_scores[c] = psi_numeric(ref_df[c], syn_df[c])
         except Exception:
             psi_scores[c] = None
-
-    overlap = {}
     for c in cats:
         try:
             overlap[c] = cat_overlap(ref_df[c], syn_df[c])
